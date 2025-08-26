@@ -78,7 +78,7 @@ success "Secure Boot is disabled or not detected."
 # 3. Find and validate the swap partition
 info "Detecting swap partition..."
 # Use lsblk to find swap partitions, get their UUID and NAME
-SWAP_PARTITIONS=$(lsblk -no NAME,TYPE,UUID | awk '$2=="swap" && $3!="" {print "/dev/"$1, $3}')
+SWAP_PARTITIONS=$(lsblk -no NAME,FSTYPE,UUID | awk '$2=="swap" && $3!="" {print "/dev/"$1, $3}')
 
 if [ -z "$SWAP_PARTITIONS" ]; then
     error "No active swap partition found. Please create and enable a swap partition first."
@@ -103,7 +103,7 @@ success "Using swap partition: ${SWAP_DEVICE} with UUID: ${SWAP_UUID}"
 # 4. Check swap size against RAM size
 info "Validating swap partition size..."
 # Get sizes in bytes for accurate comparison
-RAM_SIZE_BYTES=$(grep MemTotal /proc/meminfo | awk '{print $2}') * 1024
+RAM_SIZE_BYTES=$(( $(grep MemTotal /proc/meminfo | awk '{print $2}') * 1024 ))
 SWAP_SIZE_BYTES=$(lsblk -b -no SIZE "$SWAP_DEVICE" | head -n 1)
 RAM_SIZE_GB=$(awk "BEGIN {printf \"%.2f\", $RAM_SIZE_BYTES/1024/1024/1024}")
 SWAP_SIZE_GB=$(awk "BEGIN {printf \"%.2f\", $SWAP_SIZE_BYTES/1024/1024/1024}")
