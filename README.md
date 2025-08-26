@@ -89,8 +89,8 @@ Once your swap partition is ready, you can run the setup script.
 
 1.  **Clone or Download the Script**:
     ```bash
-    git clone https://github.com/your-username/your-repo-name.git
-    cd your-repo-name
+    git clone https://zb-ss/ubuntu-hibernation.git
+    cd ubuntu-hibernation
     ```
     Alternatively, just download the `setup_hibernation.sh` file.
 
