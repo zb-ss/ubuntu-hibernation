@@ -7,6 +7,12 @@
 # This script automates the process of enabling hibernation on Ubuntu and its
 # derivatives by configuring GRUB and initramfs to use a swap partition.
 #
+# Features:
+#   - Configures GRUB and initramfs for hibernation
+#   - Detects laptops and configures lid-close to hibernate
+#   - Supports Regolith desktop environment
+#   - Creates polkit rules for passwordless hibernation
+#
 # WARNING: This script modifies critical system files. While it includes
 #          safety checks and backups, please ensure you have backed up your
 #          important data before running it.
@@ -42,6 +48,234 @@ warning() {
 error() {
     echo -e "${RED}[ERROR]${NC} $1" >&2
     exit 1
+}
+
+# --- Detection Functions ---
+
+is_laptop() {
+    # Method 1: Check chassis type
+    # Values 8, 9, 10, 11, 14 indicate portable devices
+    # 8=Portable, 9=Laptop, 10=Notebook, 11=Hand Held, 14=Sub Notebook
+    if [[ -f /sys/class/dmi/id/chassis_type ]]; then
+        local chassis_type
+        chassis_type=$(cat /sys/class/dmi/id/chassis_type)
+        if [[ "$chassis_type" =~ ^(8|9|10|11|14)$ ]]; then
+            return 0
+        fi
+    fi
+
+    # Method 2: Check for lid switch
+    if [[ -d /proc/acpi/button/lid ]]; then
+        return 0
+    fi
+
+    # Method 3: Check for battery
+    if ls /sys/class/power_supply/BAT* &>/dev/null; then
+        return 0
+    fi
+
+    return 1
+}
+
+is_regolith() {
+    # Check for regolith config directory (works even when running as root)
+    local user_home
+    user_home=$(getent passwd "${SUDO_USER:-$USER}" | cut -d: -f6)
+    
+    if [[ -d "$user_home/.config/regolith3" ]]; then
+        return 0
+    fi
+
+    # Check for regolith-sway-clamshell (the script that handles lid events)
+    if command -v regolith-sway-clamshell &>/dev/null; then
+        return 0
+    fi
+
+    # Check if regolith packages are installed
+    if dpkg -l | grep -q "regolith-session"; then
+        return 0
+    fi
+
+    return 1
+}
+
+has_lid_switch() {
+    [[ -d /proc/acpi/button/lid ]]
+}
+
+# --- Laptop Lid Configuration Functions ---
+
+configure_regolith_lid_hibernate() {
+    local user_home
+    local xresources_file
+    local real_user="${SUDO_USER:-$USER}"
+    
+    user_home=$(getent passwd "$real_user" | cut -d: -f6)
+    xresources_file="$user_home/.config/regolith3/Xresources"
+    
+    info "Configuring Regolith lid-close hibernate..."
+    
+    # Create directory if it doesn't exist
+    mkdir -p "$(dirname "$xresources_file")"
+    
+    # Check if already configured
+    if grep -q "wm.lidclose.action.power: HIBERNATE" "$xresources_file" 2>/dev/null && \
+       grep -q "wm.lidclose.action.battery: HIBERNATE" "$xresources_file" 2>/dev/null; then
+        info "Regolith Xresources already configured for hibernate"
+        return 0
+    fi
+    
+    # Create file if it doesn't exist
+    if [[ ! -f "$xresources_file" ]]; then
+        touch "$xresources_file"
+    fi
+    
+    # Remove any existing lid close settings to avoid duplicates
+    sed -i '/wm\.lidclose\.action\./d' "$xresources_file"
+    
+    # Append hibernate settings
+    cat >> "$xresources_file" << 'EOF'
+
+! Lid close actions - hibernate instead of lock/sleep
+! Added by setup_hibernation.sh script
+wm.lidclose.action.power: HIBERNATE
+wm.lidclose.action.battery: HIBERNATE
+EOF
+    
+    # Fix ownership (since we're running as root)
+    chown "$real_user:$real_user" "$xresources_file"
+    
+    success "Configured Regolith Xresources for lid-close hibernate"
+    return 0
+}
+
+configure_systemd_logind_lid() {
+    info "Configuring systemd-logind for lid-close hibernate..."
+    
+    local logind_conf="/etc/systemd/logind.conf"
+    local logind_conf_d="/etc/systemd/logind.conf.d"
+    local custom_conf="$logind_conf_d/hibernate-on-lid.conf"
+    
+    # Use drop-in directory for cleaner configuration
+    mkdir -p "$logind_conf_d"
+    
+    cat > "$custom_conf" << 'EOF'
+# Hibernate on lid close
+# Added by setup_hibernation.sh script
+[Login]
+HandleLidSwitch=hibernate
+HandleLidSwitchExternalPower=hibernate
+HandleLidSwitchDocked=ignore
+EOF
+    
+    success "Created systemd-logind lid-close configuration"
+    info "Note: This may be overridden by desktop environment settings"
+}
+
+configure_gnome_lid_hibernate() {
+    local real_user="${SUDO_USER:-$USER}"
+    
+    info "Configuring GNOME power settings for lid-close hibernate..."
+    
+    # Run gsettings as the actual user, not root
+    if command -v gsettings &>/dev/null; then
+        su - "$real_user" -c "gsettings set org.gnome.settings-daemon.plugins.power lid-close-ac-action 'hibernate'" 2>/dev/null || true
+        su - "$real_user" -c "gsettings set org.gnome.settings-daemon.plugins.power lid-close-battery-action 'hibernate'" 2>/dev/null || true
+        success "Configured GNOME power settings for lid-close hibernate"
+    else
+        warning "gsettings not found, skipping GNOME configuration"
+    fi
+}
+
+configure_polkit_hibernate() {
+    info "Configuring polkit rules for passwordless hibernation..."
+    
+    local polkit_rules_dir="/etc/polkit-1/rules.d"
+    local polkit_rule_file="$polkit_rules_dir/85-hibernate.rules"
+    
+    # Check if polkit rules directory exists
+    if [[ ! -d "$polkit_rules_dir" ]]; then
+        warning "Polkit rules directory not found, skipping polkit configuration"
+        return 1
+    fi
+    
+    # Check if already configured
+    if [[ -f "$polkit_rule_file" ]]; then
+        info "Polkit hibernate rule already exists"
+        return 0
+    fi
+    
+    cat > "$polkit_rule_file" << 'EOF'
+// Allow users in the "users" group to hibernate without authentication
+// Added by setup_hibernation.sh script
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.login1.hibernate" ||
+        action.id == "org.freedesktop.login1.hibernate-multiple-sessions" ||
+        action.id == "org.freedesktop.login1.handle-hibernate-key" ||
+        action.id == "org.freedesktop.login1.hibernate-ignore-inhibit") {
+        if (subject.isInGroup("users")) {
+            return polkit.Result.YES;
+        }
+    }
+});
+EOF
+    
+    success "Created polkit rule for passwordless hibernation"
+    return 0
+}
+
+setup_laptop_lid_hibernate() {
+    echo
+    echo -e "${BLUE}=========================================${NC}"
+    echo -e "${BLUE} Laptop Lid-Close Configuration          ${NC}"
+    echo -e "${BLUE}=========================================${NC}"
+    echo
+    
+    if ! is_laptop; then
+        info "This system does not appear to be a laptop. Skipping lid configuration."
+        return 0
+    fi
+    
+    success "Laptop detected!"
+    
+    if ! has_lid_switch; then
+        warning "No lid switch detected. Skipping lid configuration."
+        return 0
+    fi
+    
+    success "Lid switch detected!"
+    
+    echo
+    read -p "Would you like to configure lid-close to hibernate? (Y/n): " lid_response
+    if [[ "$lid_response" =~ ^([nN][oO]|[nN])$ ]]; then
+        info "Skipping lid-close configuration."
+        return 0
+    fi
+    
+    echo
+    
+    # Configure polkit for passwordless hibernate (needed for lid-close)
+    configure_polkit_hibernate
+    
+    # Configure systemd-logind as fallback
+    configure_systemd_logind_lid
+    
+    # Configure GNOME settings (if applicable)
+    configure_gnome_lid_hibernate
+    
+    # Configure Regolith if detected
+    if is_regolith; then
+        success "Regolith desktop detected!"
+        configure_regolith_lid_hibernate
+        echo
+        info "Regolith uses its own lid-close handler (regolith-sway-clamshell)."
+        info "The Xresources configuration will take effect after you log out and log back in."
+    else
+        info "No Regolith desktop detected. Using systemd-logind and GNOME settings."
+    fi
+    
+    echo
+    success "Lid-close hibernate configuration complete!"
 }
 
 # --- Script Start ---
@@ -166,6 +400,9 @@ info "Updating initramfs..."
 update-initramfs -u -k all
 success "All changes have been applied."
 
+# 8. Configure laptop lid-close (if applicable)
+setup_laptop_lid_hibernate
+
 # --- Final Instructions ---
 echo
 echo -e "${GREEN}=========================================${NC}"
@@ -174,8 +411,17 @@ echo -e "${GREEN}=========================================${NC}"
 echo
 info "A system reboot is required for these changes to take effect."
 info "After rebooting, you can test hibernation by running:"
-echo -e "  ${YELLOW}sudo systemctl hibernate${NC}"
+echo -e "  ${YELLOW}systemctl hibernate${NC}"
 echo
+
+if is_laptop && has_lid_switch; then
+    info "Lid-close hibernate has been configured."
+    if is_regolith; then
+        info "For Regolith: Log out and log back in after reboot to apply lid settings."
+    fi
+    echo
+fi
+
 info "If you encounter any issues, your original GRUB configuration is backed up at:"
 echo -e "  ${YELLOW}${GRUB_BACKUP_FILE}${NC}"
 echo

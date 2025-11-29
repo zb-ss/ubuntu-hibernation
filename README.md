@@ -8,6 +8,15 @@ Hibernation saves the current state of your system (open applications, files, et
 
 This script makes the setup process easier by performing the necessary system checks and configuration changes automatically.
 
+## Features
+
+- **Automatic swap partition detection** - Finds and validates your swap partition
+- **GRUB and initramfs configuration** - Sets up the resume parameter for hibernation
+- **Laptop detection** - Automatically detects if running on a laptop
+- **Lid-close hibernate** - Configures laptops to hibernate when the lid is closed
+- **Desktop environment support** - Works with Regolith, GNOME, and other DEs
+- **Passwordless hibernation** - Configures polkit rules so you don't need sudo
+
 ## ❗ DISCLAIMER ❗
 
 This script modifies critical system files, specifically your GRUB (bootloader) configuration. While it includes safety checks and automatically creates a backup of your GRUB settings, there is always a small risk of issues.
@@ -117,33 +126,164 @@ After the script finishes, it will prompt you to reboot. A reboot is necessary f
 2.  Once you've logged back in, open a few applications.
 3.  Open a terminal and run the test command:
     ```bash
-    sudo systemctl hibernate
+    systemctl hibernate
     ```
     Your computer should save its state and power off completely.
 4.  Turn your computer back on. It should boot up and restore your session exactly as you left it.
+
+> **Note**: After running the script, you should be able to hibernate without `sudo` thanks to the polkit rule that was configured.
+
+---
+
+## Laptop Lid-Close Hibernate
+
+If you're running the script on a laptop, it will automatically detect this and offer to configure lid-close hibernation. This means your laptop will hibernate when you close the lid, instead of just suspending or locking.
+
+### How Laptop Detection Works
+
+The script detects laptops using multiple methods:
+- **Chassis type** - Reads `/sys/class/dmi/id/chassis_type` (values 8, 9, 10, 11, 14 indicate portable devices)
+- **Lid switch** - Checks for `/proc/acpi/button/lid`
+- **Battery** - Checks for `/sys/class/power_supply/BAT*`
+
+### Desktop Environment Support
+
+The script configures lid-close hibernate for multiple desktop environments:
+
+| Desktop Environment | Configuration Method |
+|---------------------|----------------------|
+| **Regolith** | `~/.config/regolith3/Xresources` with `wm.lidclose.action.power: HIBERNATE` |
+| **GNOME** | `gsettings` for `org.gnome.settings-daemon.plugins.power` |
+| **Others** | `systemd-logind` via `/etc/systemd/logind.conf.d/hibernate-on-lid.conf` |
+
+### Regolith Desktop Users
+
+If you're using Regolith desktop, the script will configure the `regolith-sway-clamshell` handler to hibernate on lid close. After running the script:
+
+1. Reboot your system
+2. **Log out and log back in** (required for Regolith to reload Xresources)
+3. Close your laptop lid to test hibernation
+
+The following settings are added to `~/.config/regolith3/Xresources`:
+```
+wm.lidclose.action.power: HIBERNATE
+wm.lidclose.action.battery: HIBERNATE
+```
+
+### Passwordless Hibernation
+
+The script creates a polkit rule at `/etc/polkit-1/rules.d/85-hibernate.rules` that allows users in the "users" group to hibernate without entering a password. This is necessary for lid-close hibernation to work without prompting for authentication.
+
+---
+
+## What the Script Does
+
+1. **Validates prerequisites** - Checks for root access, Secure Boot status, and swap partition
+2. **Configures GRUB** - Adds the `resume=UUID=...` parameter to the kernel command line
+3. **Configures initramfs** - Creates `/etc/initramfs-tools/conf.d/resume` with the swap UUID
+4. **Updates bootloader** - Runs `update-grub` and `update-initramfs`
+5. **Configures polkit** - Creates rules for passwordless hibernation
+6. **Configures lid-close** (laptops only):
+   - systemd-logind drop-in configuration
+   - GNOME power settings
+   - Regolith Xresources (if Regolith is detected)
 
 ---
 
 ## Troubleshooting
 
--   **System Wakes Immediately After Hibernating**: This can be caused by various issues, often related to hardware drivers (especially NVIDIA) or kernel versions. Searching online for your specific hardware and Ubuntu version may provide a solution.
--   **How to Undo Changes**: The script creates a backup of your GRUB configuration in `/etc/default/` with a timestamp, like `grub.bak.2025-08-26-12:34:56`. To revert the changes, you can restore this file:
-    ```bash
-    # Move the modified file
-    sudo mv /etc/default/grub /etc/default/grub.modified
+### System Wakes Immediately After Hibernating
+This can be caused by various issues, often related to hardware drivers (especially NVIDIA) or kernel versions. Searching online for your specific hardware and Ubuntu version may provide a solution.
 
-    # Restore the backup (use the actual backup filename)
-    sudo mv /etc/default/grub.bak.YYYY-MM-DD-HH:MM:SS /etc/default/grub
+### Lid Close Doesn't Trigger Hibernation
 
-    # Update GRUB again
-    sudo update-grub
-    ```
-    You should also delete the `resume` file created by the script:
-    ```bash
-    sudo rm /etc/initramfs-tools/conf.d/resume
-    sudo update-initramfs -u -k all
-    ```
-    Then reboot.
+**For Regolith users:**
+- Make sure you've logged out and logged back in after running the script
+- Check that the settings are in your Xresources:
+  ```bash
+  cat ~/.config/regolith3/Xresources | grep lidclose
+  ```
+- Verify the settings are loaded:
+  ```bash
+  trawlcat wm.lidclose.action.power
+  trawlcat wm.lidclose.action.battery
+  ```
+
+**For other desktops:**
+- Check systemd-logind configuration:
+  ```bash
+  cat /etc/systemd/logind.conf.d/hibernate-on-lid.conf
+  ```
+- Restart systemd-logind:
+  ```bash
+  sudo systemctl restart systemd-logind
+  ```
+
+### "Access Denied" When Trying to Hibernate
+
+If you get "Access denied" when running `systemctl hibernate`, the polkit rule may not have been created. Create it manually:
+
+```bash
+sudo tee /etc/polkit-1/rules.d/85-hibernate.rules << 'EOF'
+polkit.addRule(function(action, subject) {
+    if (action.id == "org.freedesktop.login1.hibernate" ||
+        action.id == "org.freedesktop.login1.hibernate-multiple-sessions" ||
+        action.id == "org.freedesktop.login1.handle-hibernate-key" ||
+        action.id == "org.freedesktop.login1.hibernate-ignore-inhibit") {
+        if (subject.isInGroup("users")) {
+            return polkit.Result.YES;
+        }
+    }
+});
+EOF
+```
+
+### How to Undo Changes
+
+The script creates a backup of your GRUB configuration in `/etc/default/` with a timestamp, like `grub.bak.2025-08-26-12:34:56`. To revert the changes:
+
+```bash
+# Move the modified file
+sudo mv /etc/default/grub /etc/default/grub.modified
+
+# Restore the backup (use the actual backup filename)
+sudo mv /etc/default/grub.bak.YYYY-MM-DD-HH:MM:SS /etc/default/grub
+
+# Update GRUB again
+sudo update-grub
+```
+
+You should also delete the configuration files created by the script:
+```bash
+# Remove initramfs resume config
+sudo rm /etc/initramfs-tools/conf.d/resume
+sudo update-initramfs -u -k all
+
+# Remove polkit rule
+sudo rm /etc/polkit-1/rules.d/85-hibernate.rules
+
+# Remove systemd-logind lid config
+sudo rm /etc/systemd/logind.conf.d/hibernate-on-lid.conf
+
+# Remove Regolith lid settings (if applicable)
+sed -i '/wm\.lidclose\.action\./d' ~/.config/regolith3/Xresources
+```
+
+Then reboot.
+
+---
+
+## Files Modified/Created by the Script
+
+| File | Purpose |
+|------|---------|
+| `/etc/default/grub` | Adds `resume=UUID=...` to kernel parameters |
+| `/etc/initramfs-tools/conf.d/resume` | Tells initramfs where to resume from |
+| `/etc/polkit-1/rules.d/85-hibernate.rules` | Allows passwordless hibernation |
+| `/etc/systemd/logind.conf.d/hibernate-on-lid.conf` | Configures lid-close action |
+| `~/.config/regolith3/Xresources` | Regolith lid-close settings (if applicable) |
+
+---
 
 ## License
 
